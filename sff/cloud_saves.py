@@ -702,6 +702,45 @@ def scan_all_save_locations(steam_path=None, steam32_id=None):
     """
     results = []
 
+    # Installed games whose saves are declared by the Ludusavi manifest.
+    if steam_path:
+        try:
+            from sff.cloud_save_paths import get_save_paths
+            from sff.storage.vdf import get_steam_libs, vdf_load
+            steam_root = Path(steam_path)
+            libraries = list(get_steam_libs(steam_root))
+            if steam_root not in libraries:
+                libraries.insert(0, steam_root)
+            for library in libraries:
+                for acf in (library / "steamapps").glob("appmanifest_*.acf"):
+                    try:
+                        state = vdf_load(acf).get("AppState", {})
+                        app_id = int(state.get("appid") or acf.stem.split("_", 1)[1])
+                        install_dir = state.get("installdir", "")
+                        game_name = state.get("name", "") or f"App {app_id}"
+                        base = library / "steamapps" / "common" / install_dir
+                        for raw_path in get_save_paths(app_id, str(base)):
+                            source = _normalize_path(raw_path)
+                            if not source or not source.exists():
+                                continue
+                            files = [source] if source.is_file() else [f for f in source.rglob("*") if f.is_file()]
+                            if not files:
+                                continue
+                            safe_name = "".join(c if c not in r'\/:*?"<>|' else "_" for c in game_name)
+                            results.append({
+                                "location": "Steam Install Saves",
+                                "folder_name": source.name,
+                                "app_id": app_id,
+                                "game_name": game_name,
+                                "label": f"{app_id} - {safe_name}",
+                                "source_path": str(source),
+                                "file_count": len(files),
+                            })
+                    except Exception:
+                        logger.debug("scan Ludusavi paths for %s", acf, exc_info=True)
+        except Exception as e:
+            logger.warning("scan Ludusavi save paths: %s", e)
+
     # Steam userdata
     if steam_path and steam32_id:
         userdata_dir = Path(steam_path) / "userdata" / str(steam32_id)

@@ -27,8 +27,10 @@ Only save-tagged paths matching the current platform are returned.
 Registry, config-only, and non-matching OS/store entries are skipped.
 """
 
+import glob
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -36,7 +38,8 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-_MANIFEST: dict | None = None
+_MANIFEST_TEXT: str | None = None
+_STEAM_BLOCKS: dict[str, tuple[int, int]] | None = None
 _STEAM_INDEX: dict[str, dict] | None = None
 
 
@@ -44,39 +47,51 @@ def _manifest_path() -> Path:
     return Path(__file__).resolve().parent / "data" / "manifest.yaml"
 
 
-def _load_manifest() -> dict:
-    global _MANIFEST, _STEAM_INDEX
-    if _MANIFEST is not None:
-        return _MANIFEST
+def _load_manifest_index() -> None:
+    """Index Steam entries without parsing the complete 18 MB YAML file."""
+    global _MANIFEST_TEXT, _STEAM_BLOCKS, _STEAM_INDEX
+    if _STEAM_BLOCKS is not None:
+        return
     p = _manifest_path()
     if not p.is_file():
         logger.debug("manifest.yaml not found at %s", p)
-        _MANIFEST = {}
+        _MANIFEST_TEXT = ""
+        _STEAM_BLOCKS = {}
         _STEAM_INDEX = {}
-        return _MANIFEST
+        return
     try:
-        with p.open("r", encoding="utf-8") as f:
-            _MANIFEST = yaml.safe_load(f) or {}
+        _MANIFEST_TEXT = p.read_text(encoding="utf-8")
+        starts = [m.start() for m in re.finditer(r"(?m)^(?=[^ \t\r\n#%-].*:\s*\r?$)", _MANIFEST_TEXT)]
+        starts.append(len(_MANIFEST_TEXT))
+        _STEAM_BLOCKS = {}
         _STEAM_INDEX = {}
-        for name, entry in _MANIFEST.items():
-            if not isinstance(entry, dict):
-                continue
-            steam = entry.get("steam") or {}
-            sid = str(steam.get("id", "")) if isinstance(steam, dict) else ""
-            if sid:
-                _STEAM_INDEX[sid] = entry
-        logger.debug("Loaded save-path manifest: %d games, %d with steam ids",
-                     len(_MANIFEST), len(_STEAM_INDEX))
+        steam_id = re.compile(r"(?m)^  steam:\s*\r?\n    id:\s*(\d+)\s*\r?$")
+        for start, end in zip(starts, starts[1:]):
+            match = steam_id.search(_MANIFEST_TEXT, start, end)
+            if match:
+                _STEAM_BLOCKS[match.group(1)] = (start, end)
+        logger.debug("Indexed save-path manifest: %d Steam games", len(_STEAM_BLOCKS))
     except Exception:
-        logger.warning("Failed to load manifest.yaml", exc_info=True)
-        _MANIFEST = {}
+        logger.warning("Failed to index manifest.yaml", exc_info=True)
+        _MANIFEST_TEXT = ""
+        _STEAM_BLOCKS = {}
         _STEAM_INDEX = {}
-    return _MANIFEST
 
 
 def _game_by_steam_id(app_id: int) -> dict | None:
-    _load_manifest()
-    return (_STEAM_INDEX or {}).get(str(app_id))
+    _load_manifest_index()
+    sid = str(app_id)
+    if sid in (_STEAM_INDEX or {}):
+        return _STEAM_INDEX[sid]
+    span = (_STEAM_BLOCKS or {}).get(sid)
+    if span is None or _MANIFEST_TEXT is None:
+        return None
+    parsed = yaml.safe_load(_MANIFEST_TEXT[span[0]:span[1]]) or {}
+    entry = next(iter(parsed.values()), None)
+    if isinstance(entry, dict):
+        _STEAM_INDEX[sid] = entry
+        return entry
+    return None
 
 
 def _matches_when(meta: dict) -> bool:
@@ -112,6 +127,8 @@ def _resolve_placeholder(path: str, base: str, root: str) -> list[str]:
     p = p.replace("<storeUserId>", "*")
     p = p.replace("<storeGameId>", "*")
     p = p.replace("<osUserName>", os.environ.get("USERNAME", os.environ.get("USER", "")))
+    if glob.has_magic(p):
+        return glob.glob(p)
     return [p]
 
 
