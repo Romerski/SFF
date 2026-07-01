@@ -5769,14 +5769,6 @@ class WebBridge(QObject):
 
                 import sys as _sys
                 _no_window = {"creationflags": 0x08000000} if _sys.platform == "win32" else {}
-                unique_locations = list({e["location"] for e in entries})
-                for _loc in unique_locations:
-                    subprocess.run(
-                        [_rclone_exe, "mkdir",
-                         _remote_dest.rstrip("/") + f"/SteaMidraAllSaves/{_loc}"],
-                        capture_output=True, stdin=subprocess.DEVNULL, timeout=30, **_no_window,
-                    )
-
                 def _backup_one_rclone(entry):
                     thread_log = []
                     ok = backup_save_location_rclone(
@@ -5836,10 +5828,6 @@ class WebBridge(QObject):
                         )
 
                 folder_cache = {}
-                for loc in {e["location"] for e in valid_entries}:
-                    loc_id = get_or_create_folder(svc, loc, root_id)
-                    if loc_id:
-                        folder_cache[(loc, root_id)] = loc_id
                 lock = threading.Lock()
 
                 def _backup_one_gdrive(entry):

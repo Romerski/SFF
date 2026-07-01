@@ -904,7 +904,10 @@ window.CloudSaves = (function() {
             Components.showToast('warning', 'No source path in backup metadata — cannot restore');
             return;
         }
-        if (!confirm('Restore "' + (entry.game_name || entry.folder_name) + '" to:\n' + entry.source_path + '\n\nA safety backup will be created automatically.')) {
+        var restorePaths = (entry.sources && entry.sources.length)
+            ? entry.sources.map(function(s) { return '• ' + s.source_path; }).join('\n')
+            : entry.source_path;
+        if (!confirm('Restore "' + (entry.game_name || entry.folder_name) + '" to:\n' + restorePaths + '\n\nA safety backup will be created automatically for every location.')) {
             return;
         }
         var restoreEntry = Object.assign({}, entry);

@@ -450,32 +450,13 @@ def list_backup_locations(service):
         loc_name = loc_item["name"]
         if loc_name == _META_ROOT_NAME:
             continue
-        games = []
-        for game_item in list_folder(service, loc_item["id"]):
-            if game_item["mimeType"] != "application/vnd.google-apps.folder":
-                continue
-            meta = _fetch_meta_from_index(service, root_id, loc_name, game_item["name"])
-            if not meta:
-                meta = _fetch_meta_from_folder(service, game_item["id"])
-            games.append({
-                "folder_id": game_item["id"],
-                "folder_name": game_item["name"],
-                "app_id": meta.get("app_id"),
-                "game_name": meta.get("game_name", game_item["name"]),
-                "source_path": meta.get("source_path", ""),
-                "backed_up_at": meta.get("backed_up_at", ""),
-            })
-        result[loc_name] = {"folder_id": loc_item["id"], "games": games}
+        meta = _fetch_meta_from_index(service, root_id, "Games", loc_name)
+        if not meta:
+            continue
+        result.setdefault("Games", {"folder_id": root_id, "games": []})["games"].append({
+            "folder_id": loc_item["id"], "folder_name": loc_name,
+            "app_id": meta.get("app_id"), "game_name": meta.get("game_name", loc_name),
+            "source_path": meta.get("source_path", ""), "backed_up_at": meta.get("backed_up_at", ""),
+            "sources": meta.get("sources", []),
+        })
     return result
-
-
-def _fetch_meta_from_folder(service, folder_id):
-    items = list_folder(service, folder_id)
-    for item in items:
-        if item["name"] == "steamidra_meta.json":
-            try:
-                content = service.files().get_media(fileId=item["id"]).execute()
-                return json.loads(content)
-            except Exception:
-                pass
-    return {}

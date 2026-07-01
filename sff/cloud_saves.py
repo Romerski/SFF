@@ -880,7 +880,48 @@ def scan_all_save_locations(steam_path=None, steam32_id=None):
     except Exception as e:
         logger.warning("scan custom save paths: %s", e)
 
-    return results
+    return _group_save_entries(results)
+
+
+def _safe_source_key(location, index):
+    safe = "".join(c if c not in r'\/:*?"<>|' else "_" for c in str(location or "Save"))
+    return f"{index + 1:02d}_{safe}"[:100]
+
+
+def _group_save_entries(entries):
+    """Group every discovered path for the same AppID into one backup entry."""
+    grouped = {}
+    for entry in entries:
+        app_id = entry.get("app_id")
+        key = f"appid:{app_id}" if app_id else f"path:{os.path.normcase(os.path.normpath(str(entry.get('source_path', ''))))}"
+        grouped.setdefault(key, []).append(entry)
+
+    output = []
+    for items in grouped.values():
+        first = items[0]
+        sources, seen = [], set()
+        for item in items:
+            source_path = str(item.get("source_path") or "")
+            normalized = os.path.normcase(os.path.normpath(source_path))
+            if not source_path or normalized in seen:
+                continue
+            seen.add(normalized)
+            sources.append({
+                "location": item.get("location", "Save"),
+                "folder_name": item.get("folder_name", ""),
+                "source_path": source_path,
+                "file_count": item.get("file_count", 0),
+                "storage_path": _safe_source_key(item.get("location"), len(sources)),
+            })
+        merged = dict(first)
+        merged.update({
+            "location": "Games",
+            "source_path": sources[0]["source_path"] if sources else "",
+            "file_count": sum(source.get("file_count", 0) for source in sources),
+            "sources": sources,
+        })
+        output.append(merged)
+    return output
 
 
 def _make_meta(app_id, game_name, source_path, location):
@@ -894,9 +935,29 @@ def _make_meta(app_id, game_name, source_path, location):
     }
 
 
+def _entry_sources(entry):
+    sources = entry.get("sources")
+    if isinstance(sources, list) and sources:
+        return sources
+    return [{
+        "location": entry.get("location", "Save"),
+        "folder_name": entry.get("folder_name", ""),
+        "source_path": entry.get("source_path", ""),
+        "file_count": entry.get("file_count", 0),
+        "storage_path": "",
+    }]
+
+
+def _entry_meta(entry):
+    meta = _make_meta(entry.get("app_id"), entry["game_name"], entry.get("source_path"), entry["location"])
+    meta["schema_version"] = 2
+    meta["sources"] = _entry_sources(entry)
+    return meta
+
+
 def backup_save_location_local(entry, dest_root, log_func=None):
     """
-    Copy one save entry to dest_root/SteaMidraAllSaves/{location}/{label}/.
+    Copy one grouped game to dest_root/SteaMidraAllSaves/{label}/.
     Skips files that are already up-to-date (same size and backup is not older).
     Returns dest folder path on success, None on failure.
     """
@@ -911,15 +972,21 @@ def backup_save_location_local(entry, dest_root, log_func=None):
     if not dest_root_norm:
         log(f"[!] Invalid destination root: {dest_root}")
         return None
-    dest = dest_root_norm / "SteaMidraAllSaves" / location / label
+    dest = dest_root_norm / "SteaMidraAllSaves" / label
     try:
         dest.mkdir(parents=True, exist_ok=True)
         copied = 0
         skipped = 0
-        for f in src.rglob("*"):
-            if f.is_file():
-                rel = f.relative_to(src)
-                target = dest / rel
+        for source in _entry_sources(entry):
+            source_root = _normalize_path(source.get("source_path"))
+            if not source_root or not source_root.exists():
+                raise FileNotFoundError(source.get("source_path"))
+            payload = dest / source["storage_path"]
+            for f in source_root.rglob("*"):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(source_root)
+                target = payload / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if target.exists():
                     src_stat = f.stat()
@@ -931,7 +998,7 @@ def backup_save_location_local(entry, dest_root, log_func=None):
                 copied += 1
         meta_path = dest / "steamidra_meta.json"
         meta_path.write_text(
-            json.dumps(_make_meta(entry.get("app_id"), entry["game_name"], src, location), indent=2),
+            json.dumps(_entry_meta(entry), indent=2),
             encoding="utf-8"
         )
         if skipped:
@@ -945,7 +1012,7 @@ def backup_save_location_local(entry, dest_root, log_func=None):
 
 
 def backup_save_location_rclone(entry, rclone_exe, remote_dest, log_func=None):
-    """Upload one save entry via rclone to remote_dest:SteaMidraAllSaves/{location}/{label}/."""
+    """Upload one grouped game directly below remote_dest/SteaMidraAllSaves/."""
     import subprocess
     import tempfile
     log = log_func or (lambda m: None)
@@ -955,26 +1022,29 @@ def backup_save_location_rclone(entry, rclone_exe, remote_dest, log_func=None):
         return False
     label = entry["label"]
     location = entry["location"]
-    remote_path = remote_dest.rstrip("/") + f"/SteaMidraAllSaves/{location}/{label}"
+    remote_path = remote_dest.rstrip("/") + f"/SteaMidraAllSaves/{label}"
     try:
-        proc = subprocess.run(
-            [
-                rclone_exe, "copy", str(src), remote_path,
+        for source in _entry_sources(entry):
+            source_root = _normalize_path(source.get("source_path"))
+            if not source_root or not source_root.exists():
+                return False
+            proc = subprocess.run(
+                [
+                rclone_exe, "copy", str(source_root), remote_path + "/" + source["storage_path"],
                 "--update",
                 "--transfers", "9", "--checkers", "18",
                 "--create-empty-src-dirs",
                 "--fast-list",
-            ],
-            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300, **_CREATE_NO_WINDOW,
-        )
-        if proc.returncode != 0:
-            log(f"  [FAIL] rclone exit {proc.returncode}: {proc.stderr[:200]}")
-            return False
+                ], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300, **_CREATE_NO_WINDOW,
+            )
+            if proc.returncode != 0:
+                log(f"  [FAIL] rclone exit {proc.returncode}: {proc.stderr[:200]}")
+                return False
         meta_tmp = Path(tempfile.mkdtemp(prefix="steamidra_meta_"))
         try:
             meta_file = meta_tmp / "steamidra_meta.json"
             meta_file.write_text(
-                json.dumps(_make_meta(entry.get("app_id"), entry["game_name"], src, location), indent=2),
+                json.dumps(_entry_meta(entry), indent=2),
                 encoding="utf-8",
             )
             subprocess.run(
@@ -1006,28 +1076,27 @@ def backup_save_location_gdrive(entry, service, backup_root_id, log_func=None, f
     location = entry["location"]
     local_fc = dict(folder_cache) if folder_cache is not None else {}
     try:
-        loc_cache_key = (location, backup_root_id)
-        if loc_cache_key in local_fc:
-            loc_folder_id = local_fc[loc_cache_key]
-        else:
-            loc_folder_id = get_or_create_folder(service, location, backup_root_id)
-            if loc_folder_id:
-                local_fc[loc_cache_key] = loc_folder_id
-        if not loc_folder_id:
-            log(f"  [FAIL] Could not create Drive folder for {location}")
+        loc_folder_id = backup_root_id
+        game_folder_id = get_or_create_folder(service, label, loc_folder_id)
+        if not game_folder_id:
+            log(f"  [FAIL] Could not create Drive folder for {label}")
             return False
-        ok = upload_folder(service, src, loc_folder_id, log_func=log, folder_cache=local_fc, drive_folder_name=label)
+        local_fc[(label, loc_folder_id)] = game_folder_id
+        ok = True
+        for source in _entry_sources(entry):
+            source_root = _normalize_path(source.get("source_path"))
+            if not source_root or not source_root.exists():
+                ok = False
+                break
+            ok = upload_folder(
+                service, source_root, game_folder_id, log_func=log,
+                folder_cache=local_fc, drive_folder_name=source["storage_path"],
+            ) and ok
         if ok:
-            game_folder_id = local_fc.get((label, loc_folder_id))
-            if game_folder_id:
-                write_backup_meta(
-                    service,
-                    backup_root_id,
-                    location,
-                    label,
-                    _make_meta(entry.get("app_id"), entry["game_name"], src, location),
-                    log_func=log,
-                )
+            write_backup_meta(
+                service, backup_root_id, "Games", label,
+                _entry_meta(entry), log_func=log,
+            )
             log(f"  Synced to Drive: {label}")
         if folder_cache is not None:
             folder_cache.update(local_fc)
@@ -1038,10 +1107,7 @@ def backup_save_location_gdrive(entry, service, backup_root_id, log_func=None, f
 
 
 def scan_backup_root_rclone(rclone_exe, remote_dest):
-    """Scan an rclone remote for SteaMidraAllSaves structure.
-    Downloads all steamidra_meta.json files at once, then parses them locally.
-    Returns same structure as scan_backup_root_local.
-    """
+    """Scan only the direct-root grouped backup format on an rclone remote."""
     import subprocess
     import tempfile
     remote_root = remote_dest.rstrip("/") + "/SteaMidraAllSaves"
@@ -1059,35 +1125,21 @@ def scan_backup_root_rclone(rclone_exe, remote_dest):
         result = {}
         if not tmp.exists():
             return result
-        for loc_dir in sorted(tmp.iterdir()):
-            if not loc_dir.is_dir():
+        for game_dir in sorted(tmp.iterdir()):
+            meta_file = game_dir / "steamidra_meta.json"
+            if not game_dir.is_dir() or not meta_file.exists():
                 continue
-            games = []
-            for game_dir in sorted(loc_dir.iterdir()):
-                if not game_dir.is_dir():
-                    continue
-                meta = {}
-                meta_file = game_dir / "steamidra_meta.json"
-                if meta_file.exists():
-                    try:
-                        meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                    except Exception:
-                        pass
-                game_remote = remote_root + "/" + loc_dir.name + "/" + game_dir.name
-                games.append({
-                    "folder_path": game_remote,
-                    "folder_name": game_dir.name,
-                    "app_id": meta.get("app_id"),
-                    "game_name": meta.get("game_name", game_dir.name),
-                    "source_path": meta.get("source_path", ""),
-                    "backed_up_at": meta.get("backed_up_at", ""),
-                    "rclone_path": game_remote,
-                })
-            if games:
-                result[loc_dir.name] = {
-                    "folder_path": remote_root + "/" + loc_dir.name,
-                    "games": games,
-                }
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            game_remote = remote_root + "/" + game_dir.name
+            result.setdefault("Games", {"folder_path": remote_root, "games": []})["games"].append({
+                "folder_path": game_remote, "folder_name": game_dir.name,
+                "app_id": meta.get("app_id"), "game_name": meta.get("game_name", game_dir.name),
+                "source_path": meta.get("source_path", ""), "backed_up_at": meta.get("backed_up_at", ""),
+                "rclone_path": game_remote, "sources": meta.get("sources", []),
+            })
         return result
     except Exception:
         return {}
@@ -1096,37 +1148,25 @@ def scan_backup_root_rclone(rclone_exe, remote_dest):
 
 
 def scan_backup_root_local(backup_root):
-    """
-    Scan a local SteaMidraAllSaves root folder.
-    Returns same structure as google_drive.list_backup_locations.
-    """
+    """Scan only the direct-root grouped local backup format."""
     root = Path(backup_root) / "SteaMidraAllSaves"
     if not root.exists():
         return {}
     result = {}
-    for loc_dir in sorted(root.iterdir()):
-        if not loc_dir.is_dir():
+    for game_dir in sorted(root.iterdir()):
+        meta_file = game_dir / "steamidra_meta.json"
+        if not game_dir.is_dir() or not meta_file.exists():
             continue
-        games = []
-        for game_dir in sorted(loc_dir.iterdir()):
-            if not game_dir.is_dir():
-                continue
-            meta = {}
-            meta_file = game_dir / "steamidra_meta.json"
-            if meta_file.exists():
-                try:
-                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
-            games.append({
-                "folder_path": str(game_dir),
-                "folder_name": game_dir.name,
-                "app_id": meta.get("app_id"),
-                "game_name": meta.get("game_name", game_dir.name),
-                "source_path": meta.get("source_path", ""),
-                "backed_up_at": meta.get("backed_up_at", ""),
-            })
-        result[loc_dir.name] = {"folder_path": str(loc_dir), "games": games}
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        result.setdefault("Games", {"folder_path": str(root), "games": []})["games"].append({
+            "folder_path": str(game_dir), "folder_name": game_dir.name,
+            "app_id": meta.get("app_id"), "game_name": meta.get("game_name", game_dir.name),
+            "source_path": meta.get("source_path", ""), "backed_up_at": meta.get("backed_up_at", ""),
+            "sources": meta.get("sources", []),
+        })
     return result
 
 
@@ -1137,6 +1177,10 @@ def restore_save_entry(game_entry, log_func=None):
     Creates a safety backup of the current saves first.
     """
     log = log_func or (lambda m: None)
+    sources = game_entry.get("sources")
+    if isinstance(sources, list) and sources:
+        return _restore_multi_source_entry(game_entry, sources, log)
+
     raw_dest = game_entry.get("source_path")
     dest = _normalize_path(raw_dest) if raw_dest else None
     if not dest:
@@ -1198,6 +1242,51 @@ def restore_save_entry(game_entry, log_func=None):
     else:
         log("[FAIL] No folder_path or folder_id in entry.")
         return False
+
+
+def _restore_multi_source_entry(game_entry, sources, log):
+    """Download one grouped backup and restore all paths recorded in its metadata."""
+    import tempfile
+    tmp = None
+    try:
+        if game_entry.get("rclone_path") and game_entry.get("rclone_exe", "").strip():
+            import subprocess
+            tmp = Path(tempfile.mkdtemp(prefix="steamidra_restore_"))
+            proc = subprocess.run(
+                [game_entry["rclone_exe"].strip(), "copy", game_entry["rclone_path"], str(tmp),
+                 "--exclude", "steamidra_meta.json", "--transfers", "10", "--fast-list"],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300, **_CREATE_NO_WINDOW,
+            )
+            if proc.returncode != 0:
+                log(f"[FAIL] rclone download failed: {proc.stderr[:200]}")
+                return False
+            src_root = tmp
+        elif game_entry.get("folder_id"):
+            from sff.google_drive import get_service, download_folder
+            service = get_service()
+            if not service:
+                return False
+            tmp = Path(tempfile.mkdtemp(prefix="steamidra_restore_"))
+            if not download_folder(service, game_entry["folder_id"], tmp, log_func=log):
+                return False
+            src_root = tmp
+        elif game_entry.get("folder_path"):
+            src_root = Path(game_entry["folder_path"])
+        else:
+            return False
+
+        for source in sources:
+            dest = _normalize_path(source.get("source_path"))
+            payload = src_root / source.get("storage_path", "")
+            if not dest or not payload.exists():
+                log(f"[FAIL] Missing payload for {source.get('location', 'save')}")
+                return False
+            if not _do_restore_copy(payload, dest, log):
+                return False
+        return True
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _do_restore_copy(src, dest, log):
